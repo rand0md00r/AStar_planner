@@ -1,0 +1,13 @@
+<launch>
+
+    <!--  ************** Map **************  -->
+    <node name="map_server" pkg="map_server" type="map_server" args="$(find mpc_tracker)/map/nav.yaml" output="screen" >
+        <param name="frame_id" value="map"/>
+    </node>
+
+    <!-- <node name="my_planner_node" pkg="my_robot_planner" type="my_robot_planner_node" output="screen" /> -->
+
+    <!--  ************** Visualisation **************  -->
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find my_robot_planner)/launch/show.rviz"/>
+
+</launch>

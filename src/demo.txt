@@ -1,0 +1,889 @@
+// astar_planner_node.cpp
+
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <nav_msgs/Path.h>
+#include <queue>
+#include <vector>
+#include <cmath>
+
+// Define a structure to represent a node in the grid map
+struct Node {
+    int x;
+    int y;
+    double f;  // f = g + h, the total cost
+    double g;  // cost from start to current node
+    double h;  // heuristic cost from current node to goal
+    Node* parent;
+
+    Node(int x_, int y_) : x(x_), y(y_), f(0.0), g(0.0), h(0.0), parent(nullptr) {}
+
+    // Overload the "<" operator for priority queue sorting
+    bool operator<(const Node& other) const {
+        return f > other.f;  // Greater than for min-heap
+    }
+};
+
+class AStarPlannerNode {
+public:
+    AStarPlannerNode() : nh("~") {
+        // Subscribe to topics
+        map_sub = nh.subscribe("/map", 1, &AStarPlannerNode::mapCallback, this);
+        
+        current_robot_pose.pose.position.x = map.info.width ;      // for debug
+        current_robot_pose.pose.position.y = map.info.height / 2;      // for debug
+        ROS_INFO("Hand set pose: x=%.2f, y=%.2f", current_robot_pose.pose.position.x, current_robot_pose.pose.position.y);
+
+        robot_pose_sub = nh.subscribe("/robot_pose", 1, &AStarPlannerNode::robotPoseCallback, this);
+        goal_sub = nh.subscribe("/move_base_simple/goal", 1, &AStarPlannerNode::goalCallback, this);
+        
+
+        // Create a publisher for the path
+        path_pub = nh.advertise<nav_msgs::Path>("/AStar_path", 1);
+        ori_path_pub = nh.advertise<nav_msgs::Path>("/Origin_Astar_path", 1);
+        // Create a publisher for the binary map
+        binary_map_pub = nh.advertise<nav_msgs::OccupancyGrid>("/binary_map", 1);
+        inf_map_pub = nh.advertise<nav_msgs::OccupancyGrid>("/inflated_map", 1);
+
+
+        nh.param<double>("inflation_radius", inflation_radius, 0.5);
+
+        // Read the planning frequency parameter from the parameter server
+        nh.param<double>("planning_frequency", planning_frequency, 1.0); // Default: 1.0 Hz
+        ROS_INFO("Planning frequency set to: %.1f Hz", planning_frequency);
+
+        ROS_INFO("A* Planner Node Initialized.");
+    }
+
+    // Callback function for /robot_pose topic
+    void robotPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        // Update robot pose
+        current_robot_pose.pose.position.x = msg->pose.position.x;
+        current_robot_pose.pose.position.y = msg->pose.position.y;
+
+        ROS_INFO("Received robot pose: x=%.2f, y=%.2f", current_robot_pose.pose.position.x, current_robot_pose.pose.position.y);
+    }
+
+    // Callback function for /goal topic
+    void goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        // Update goal position
+        
+        goal_position.pose.position.x = msg->pose.position.x;
+        goal_position.pose.position.y = msg->pose.position.y;
+
+        ROS_INFO("Received goal position: x=%.2f, y=%.2f", goal_position.pose.position.x, goal_position.pose.position.y);
+    }
+
+    // Callback function for /map topic
+    void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr& msg) {
+        // Update the map data
+        map = *msg;
+        map_received = true;
+
+        ROS_INFO("Received map data. Map size: %d x %d", map.info.width, map.info.height);
+
+        // Process the map data: Binarize the map (0 for free space, 100 for obstacles)
+        for (size_t i = 0; i < map.data.size(); ++i) {
+            if (map.data[i] < 0) {
+                map.data[i] = 0; // Set unknown space as free space
+            } else if (map.data[i] >= 50) {
+                map.data[i] = 100; // Set obstacles as obstacle space
+            }
+            // else, keep the original value (known free space)
+        }
+
+        // Inflate the obstacles in the map
+        inflateObstacles(0.1, 0.5);
+
+        // Publish the binary map
+        binary_map_pub.publish(map);
+        inf_map_pub.publish(inflated_map);
+    }
+
+    // A* path planning algorithm implementation
+    std::vector<geometry_msgs::Point> astarPlanner() {
+        // Check if the inflated_map data has been received
+        if (!map_received) 
+        {
+            ROS_WARN("Map data not received yet. Cannot plan the path.");
+            return std::vector<geometry_msgs::Point>(); // Return an empty path
+        }
+
+
+        // Convert the start and goal positions from world coordinates to grid coordinates
+        int start_grid_x = (current_robot_pose.pose.position.x - inflated_map.info.origin.position.x) / inflated_map.info.resolution;
+        int start_grid_y = (current_robot_pose.pose.position.y - inflated_map.info.origin.position.y) / inflated_map.info.resolution;
+        int goal_grid_x = (goal_position.pose.position.x - inflated_map.info.origin.position.x) / inflated_map.info.resolution;
+        int goal_grid_y = (goal_position.pose.position.y - inflated_map.info.origin.position.y) / inflated_map.info.resolution;
+
+
+        // Check if the goal position is valid
+        if (goal_grid_x < 0 || goal_grid_x >= inflated_map.info.width ||
+            goal_grid_y < 0 || goal_grid_y >= inflated_map.info.height) 
+        {
+            ROS_WARN("Invalid goal position. Goal is outside the inflated_map. Cannot plan the path.");
+            return std::vector<geometry_msgs::Point>(); // Return an empty path
+        }
+
+
+        // Initialize the A* algorithm
+        std::priority_queue<Node> open_list;
+        std::vector<std::vector<bool>> closed_list(inflated_map.info.height, std::vector<bool>(inflated_map.info.width, false));
+
+
+        // Add the start node to the open list
+        Node start_node(start_grid_x, start_grid_y);
+        start_node.g = 0.0;
+        start_node.h = calculateHeuristic(start_node.x, start_node.y, goal_grid_x, goal_grid_y);
+        start_node.f = start_node.g + start_node.h;
+        open_list.push(start_node);
+
+
+        // Define the possible movement directions (8-connectivity)
+        std::vector<int> dx = {-1, 0, 1, -1, 1, -1, 0, 1};
+        std::vector<int> dy = {-1, -1, -1, 0, 0, 1, 1, 1};
+        // A* algorithm main loop
+        while (!open_list.empty()) {
+            Node current_node = open_list.top();
+            open_list.pop();
+
+            // Check if the goal is reached
+            if (current_node.x == goal_grid_x && current_node.y == goal_grid_y) {
+                // Goal reached, reconstruct the path
+                std::vector<geometry_msgs::Point> path;
+                while (current_node.parent) {
+                    geometry_msgs::Point point;
+                    point.x = current_node.x * inflated_map.info.resolution + inflated_map.info.origin.position.x;
+                    point.y = current_node.y * inflated_map.info.resolution + inflated_map.info.origin.position.y;
+                    path.push_back(point);
+                    current_node = *current_node.parent;
+                }
+                std::reverse(path.begin(), path.end());
+                return path;
+            }
+
+            // Expand the current node's neighbors
+            for (size_t i = 0; i < dx.size(); ++i) {
+                int next_x = current_node.x + dx[i];
+                int next_y = current_node.y + dy[i];
+
+                // Check if the next position is within the map boundaries
+                if (next_x >= 0 && next_x < inflated_map.info.width && next_y >= 0 && next_y < inflated_map.info.height) {
+                    // Check if the next position is not an obstacle (occupancy > 50)
+                    int index = next_y * inflated_map.info.width + next_x;
+                    if (inflated_map.data[index] < 5 && !closed_list[next_y][next_x]) {
+                        Node neighbor(next_x, next_y);
+                        neighbor.g = current_node.g + 1.0; // Assuming the cost of moving to a neighbor is 1
+                        neighbor.h = calculateHeuristic(neighbor.x, neighbor.y, goal_grid_x, goal_grid_y);
+                        neighbor.f = neighbor.g + neighbor.h;
+                        neighbor.parent = new Node(current_node);
+                        open_list.push(neighbor);
+                        closed_list[next_y][next_x] = true;
+                    }
+                }
+            }
+        }
+
+        // Goal not reachable, return an empty path
+        ROS_WARN("Goal not reachable. Failed to find a path.");
+        return std::vector<geometry_msgs::Point>();
+    }
+
+    struct routePoint {
+        int pointVal;
+        int pointIndex;
+        geometry_msgs::Point pointPose;
+    };
+
+    std::vector<geometry_msgs::Point> prunePath(const nav_msgs::OccupancyGrid& map, const std::vector<geometry_msgs::Point>& path) {
+        if(map.data.empty() || path.empty()) return std::vector<geometry_msgs::Point> ();
+        std::cout << "路径点数量:" << path.size() << std::endl;
+
+        double resolution = 0.05;
+        std::vector<routePoint> new_route;
+
+        for(int i = 0; i < path.size(); ++i) {
+            routePoint curPoint;
+            curPoint.pointPose.x = path[i].x;
+            curPoint.pointPose.y = path[i].y;
+            int path_index = std::round((path[i].x - map.info.origin.position.x) / resolution) +map.info.width *std::round(curPoint.pointPose.y / resolution) + std::floor(map.info.height * map.info.width / 2);
+            curPoint.pointVal = 1;
+            curPoint.pointIndex = path_index;
+            new_route.push_back(curPoint);
+        }
+        std::cout << "一维向量的长度:" << new_route.size() << std::endl;
+        std::cout << "map.data.size():" << map.data.size() << std::endl;
+        std::cout << "map.info.height:" << map.info.height << std::endl;
+        std::cout << "map.info.width:" << map.info.width << std::endl;
+        std::vector<geometry_msgs::Point> prunedPath;
+        geometry_msgs::Point prunedPoints;
+        prunedPoints.x = new_route[0].pointPose.x;
+        prunedPoints.y = new_route[0].pointPose.y;
+        prunedPath.push_back(prunedPoints);
+        bool end_flag = true;
+        int idx = 0;
+        while(end_flag){
+            for(int j = new_route.size() - 1; j >= idx + 1; --j){
+                double start_x = new_route[idx].pointPose.x;
+                double start_y = new_route[idx].pointPose.y;
+                double end_x = new_route[j].pointPose.x;
+                double end_y = new_route[j].pointPose.y;
+                double theta = atan2(end_y - start_y, end_x - start_x);
+                double dx = cos(theta);
+                double dy = sin(theta);
+                int L = std::floor((end_x - start_x)/resolution);
+                
+                bool cross = true;
+                int map_or_x = map.info.origin.position.x;
+                int map_or_y = map.info.origin.position.y;
+                for (int k = 1; k <= L; ++k) {
+                    double p_x = start_x + k*dx;
+                    double p_y = start_y + theta*(p_x-start_x);
+                    int Node_index = std::round((p_x-map_or_x)/resolution) + map.info.width*std::round((p_y-map_or_y)/resolution);
+                    if(map.data[Node_index] >= 50) {
+                        cross = false;
+                        break;
+                    }                   
+                }
+                
+                if(cross == true) {
+                    if(j == new_route.size() - 1)
+                        end_flag = false;
+                    idx = j;
+                    prunedPoints.x = new_route[idx].pointPose.x;
+                    prunedPoints.y = new_route[idx].pointPose.y;
+                    prunedPath.push_back(prunedPoints);                   
+                }
+
+
+            }
+        }
+        
+
+        // for (int i = 0; i <= new_route.size(); ++i) {
+        //     geometry_msgs::Point prunedPoints;
+        //     if(new_route[i].pointVal == 1) {
+        //         prunedPoints.x = new_route[i].pointPose.x;
+        //         prunedPoints.y = new_route[i].pointPose.y;
+        //         prunedPath.push_back(prunedPoints);
+        //     }
+        // }
+        std::cout << "剪枝后剩余的点的数量为:  " << prunedPath.size() << std::endl;
+        return prunedPath;
+    }
+
+
+
+    // Publish the planned path
+    void publishPath(const std::vector<geometry_msgs::Point>& path) {
+        nav_msgs::Path path_msg;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.header.frame_id = "map"; // Assuming the path is in the map frame
+
+        // Convert the vector of points to the path message
+        for (const auto& point : path) {
+            geometry_msgs::PoseStamped pose;
+            pose.header = path_msg.header;
+            pose.pose.position.x = point.x;
+            pose.pose.position.y = point.y;
+            pose.pose.position.z = 0.0; // Assuming the path is in 2D
+            pose.pose.orientation.x = 0.0;
+            pose.pose.orientation.y = 0.0;
+            pose.pose.orientation.z = 0.0;
+            pose.pose.orientation.w = 1.0;
+            path_msg.poses.push_back(pose);
+        }
+
+        // Publish the path message
+        path_pub.publish(path_msg);
+    }
+
+    // Publish the planned path
+    void publistOriginPath(const std::vector<geometry_msgs::Point>& path) {
+        nav_msgs::Path path_msg;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.header.frame_id = "map"; // Assuming the path is in the map frame
+
+        // Convert the vector of points to the path message
+        for (const auto& point : path) {
+            geometry_msgs::PoseStamped pose;
+            pose.header = path_msg.header;
+            pose.pose.position.x = point.x;
+            pose.pose.position.y = point.y;
+            pose.pose.position.z = 0.0; // Assuming the path is in 2D
+            pose.pose.orientation.x = 0.0;
+            pose.pose.orientation.y = 0.0;
+            pose.pose.orientation.z = 0.0;
+            pose.pose.orientation.w = 1.0;
+            path_msg.poses.push_back(pose);
+        }
+
+        // Publish the path message
+        ori_path_pub.publish(path_msg);
+    }
+
+    // Main loop of the node
+    void run() {
+        ros::Rate loop_rate(planning_frequency);
+
+        while (ros::ok()) {
+            // Call the A* path planning algorithm
+            std::vector<geometry_msgs::Point> path = astarPlanner();
+
+            std::vector<geometry_msgs::Point> prune_Path = prunePath(inflated_map, path);
+
+            // Publish the path (you can convert the vector of points to a ROS message)
+            publishPath(prune_Path);
+            publistOriginPath(path);
+
+            ros::spinOnce();
+            loop_rate.sleep();
+        }
+    }
+
+
+
+
+private:
+    ros::NodeHandle nh;
+    ros::Subscriber robot_pose_sub;
+    ros::Subscriber goal_sub;
+    ros::Subscriber map_sub;
+    ros::Publisher path_pub;
+    ros::Publisher ori_path_pub;
+    ros::Publisher binary_map_pub; // Publisher for binary map
+    ros::Publisher inf_map_pub;
+
+    // Planning frequency parameter
+    double planning_frequency;
+
+    // Current robot pose and goal position
+    geometry_msgs::PoseStamped current_robot_pose;
+    geometry_msgs::PoseStamped goal_position;
+
+    double inflation_radius;
+
+    // OccupancyGrid to hold the map data
+    nav_msgs::OccupancyGrid map;
+    nav_msgs::OccupancyGrid inflated_map;
+    bool map_received;
+
+
+    // Helper function to inflate the obstacles in the map
+void inflateObstacles(double d_cell, double inflation_r) {
+    // Copy the original map data to a temporary map
+    inflated_map = map;
+
+    // Calculate the inflation radius in terms of grid cells
+    int inflation_radius_in_cells = std::ceil(inflation_r / d_cell);
+
+    // Define the possible movement directions (4-connectivity)
+    std::vector<int> dx = {-1, 0, 1, -1, 1, -1, 0, 1};
+    std::vector<int> dy = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    // Traverse the map and inflate obstacles
+    for (int y = 0; y < map.info.height; ++y) {
+        for (int x = 0; x < map.info.width; ++x) {
+            // Check if the cell is an obstacle
+            int index = y * map.info.width + x;
+            if (map.data[index] == 100) {
+                // Inflate the obstacle
+                for (int r = 1; r <= inflation_radius_in_cells; ++r) {
+                    for (size_t i = 0; i < dx.size(); ++i) {
+                        int nx = x + dx[i] * r;
+                        int ny = y + dy[i] * r;
+
+                        // Check if the neighbor cell is within the map boundaries
+                        if (nx >= 0 && nx < map.info.width && ny >= 0 && ny < map.info.height) {
+                            int nIndex = ny * map.info.width + nx;
+                            inflated_map.data[nIndex] = 100;
+                            // if (inflated_map.data[nIndex] != 100) {
+                            //     // Inflate the cell
+                            //     inflated_map.data[nIndex] = 100;
+                            // }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+    // Helper function to calculate the Euclidean distance heuristic
+    double calculateHeuristic(int x1, int y1, int x2, int y2) {
+        return std::sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+    }
+
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "astar_planner_node");
+
+    AStarPlannerNode planner_node;
+    planner_node.run();
+
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// astar_planner_node.cpp
+
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <nav_msgs/Path.h>
+#include <queue>
+#include <vector>
+#include <cmath>
+
+// Define a structure to represent a node in the grid map
+struct Node {
+    int x;
+    int y;
+    double f;  // f = g + h, the total cost
+    double g;  // cost from start to current node
+    double h;  // heuristic cost from current node to goal
+    Node* parent;
+
+    Node(int x_, int y_) : x(x_), y(y_), f(0.0), g(0.0), h(0.0), parent(nullptr) {}
+
+    // Overload the "<" operator for priority queue sorting
+    bool operator<(const Node& other) const {
+        return f > other.f;  // Greater than for min-heap
+    }
+};
+
+class AStarPlannerNode {
+public:
+    AStarPlannerNode() : nh("~") {
+        // Subscribe to topics
+        map_sub = nh.subscribe("/map", 1, &AStarPlannerNode::mapCallback, this);
+        
+        current_robot_pose.pose.position.x = map.info.width ;      // for debug
+        current_robot_pose.pose.position.y = map.info.height / 2;      // for debug
+        ROS_INFO("Hand set pose: x=%.2f, y=%.2f", current_robot_pose.pose.position.x, current_robot_pose.pose.position.y);
+
+        robot_pose_sub = nh.subscribe("/robot_pose", 1, &AStarPlannerNode::robotPoseCallback, this);
+        goal_sub = nh.subscribe("/move_base_simple/goal", 1, &AStarPlannerNode::goalCallback, this);
+        
+
+        // Create a publisher for the path
+        path_pub = nh.advertise<nav_msgs::Path>("/AStar_path", 1);
+        ori_path_pub = nh.advertise<nav_msgs::Path>("/Origin_Astar_path", 1);
+        // Create a publisher for the binary map
+        binary_map_pub = nh.advertise<nav_msgs::OccupancyGrid>("/binary_map", 1);
+        inf_map_pub = nh.advertise<nav_msgs::OccupancyGrid>("/inflated_map", 1);
+
+
+        nh.param<double>("inflation_radius", inflation_radius, 0.5);
+
+        // Read the planning frequency parameter from the parameter server
+        nh.param<double>("planning_frequency", planning_frequency, 1.0); // Default: 1.0 Hz
+        ROS_INFO("Planning frequency set to: %.1f Hz", planning_frequency);
+
+        ROS_INFO("A* Planner Node Initialized.");
+    }
+
+    // Callback function for /robot_pose topic
+    void robotPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        // Update robot pose
+        current_robot_pose.pose.position.x = msg->pose.position.x;
+        current_robot_pose.pose.position.y = msg->pose.position.y;
+
+        ROS_INFO("Received robot pose: x=%.2f, y=%.2f", current_robot_pose.pose.position.x, current_robot_pose.pose.position.y);
+    }
+
+    // Callback function for /goal topic
+    void goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        // Update goal position
+        
+        goal_position.pose.position.x = msg->pose.position.x;
+        goal_position.pose.position.y = msg->pose.position.y;
+
+        ROS_INFO("Received goal position: x=%.2f, y=%.2f", goal_position.pose.position.x, goal_position.pose.position.y);
+    }
+
+    // Callback function for /map topic
+    void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr& msg) {
+        // Update the map data
+        map = *msg;
+        map_received = true;
+
+        ROS_INFO("Received map data. Map size: %d x %d", map.info.width, map.info.height);
+
+        // Process the map data: Binarize the map (0 for free space, 100 for obstacles)
+        for (size_t i = 0; i < map.data.size(); ++i) {
+            if (map.data[i] < 0) {
+                map.data[i] = 0; // Set unknown space as free space
+            } else if (map.data[i] >= 50) {
+                map.data[i] = 100; // Set obstacles as obstacle space
+            }
+            // else, keep the original value (known free space)
+        }
+
+        // Inflate the obstacles in the map
+        inflateObstacles(0.1, 0.5);
+
+        // Publish the binary map
+        binary_map_pub.publish(map);
+        inf_map_pub.publish(inflated_map);
+    }
+
+    // A* path planning algorithm implementation
+    std::vector<geometry_msgs::Point> astarPlanner() {
+        // Check if the inflated_map data has been received
+        if (!map_received) 
+        {
+            ROS_WARN("Map data not received yet. Cannot plan the path.");
+            return std::vector<geometry_msgs::Point>(); // Return an empty path
+        }
+
+
+        // Convert the start and goal positions from world coordinates to grid coordinates
+        int start_grid_x = (current_robot_pose.pose.position.x - inflated_map.info.origin.position.x) / inflated_map.info.resolution;
+        int start_grid_y = (current_robot_pose.pose.position.y - inflated_map.info.origin.position.y) / inflated_map.info.resolution;
+        int goal_grid_x = (goal_position.pose.position.x - inflated_map.info.origin.position.x) / inflated_map.info.resolution;
+        int goal_grid_y = (goal_position.pose.position.y - inflated_map.info.origin.position.y) / inflated_map.info.resolution;
+
+
+        // Check if the goal position is valid
+        if (goal_grid_x < 0 || goal_grid_x >= inflated_map.info.width ||
+            goal_grid_y < 0 || goal_grid_y >= inflated_map.info.height) 
+        {
+            ROS_WARN("Invalid goal position. Goal is outside the inflated_map. Cannot plan the path.");
+            return std::vector<geometry_msgs::Point>(); // Return an empty path
+        }
+
+
+        // Initialize the A* algorithm
+        std::priority_queue<Node> open_list;
+        std::vector<std::vector<bool>> closed_list(inflated_map.info.height, std::vector<bool>(inflated_map.info.width, false));
+
+
+        // Add the start node to the open list
+        Node start_node(start_grid_x, start_grid_y);
+        start_node.g = 0.0;
+        start_node.h = calculateHeuristic(start_node.x, start_node.y, goal_grid_x, goal_grid_y);
+        start_node.f = start_node.g + start_node.h;
+        open_list.push(start_node);
+
+
+        // Define the possible movement directions (8-connectivity)
+        std::vector<int> dx = {-1, 0, 1, -1, 1, -1, 0, 1};
+        std::vector<int> dy = {-1, -1, -1, 0, 0, 1, 1, 1};
+        // A* algorithm main loop
+        while (!open_list.empty()) {
+            Node current_node = open_list.top();
+            open_list.pop();
+
+            // Check if the goal is reached
+            if (current_node.x == goal_grid_x && current_node.y == goal_grid_y) {
+                // Goal reached, reconstruct the path
+                std::vector<geometry_msgs::Point> path;
+                while (current_node.parent) {
+                    geometry_msgs::Point point;
+                    point.x = current_node.x * inflated_map.info.resolution + inflated_map.info.origin.position.x;
+                    point.y = current_node.y * inflated_map.info.resolution + inflated_map.info.origin.position.y;
+                    path.push_back(point);
+                    current_node = *current_node.parent;
+                }
+                std::reverse(path.begin(), path.end());
+                return path;
+            }
+
+            // Expand the current node's neighbors
+            for (size_t i = 0; i < dx.size(); ++i) {
+                int next_x = current_node.x + dx[i];
+                int next_y = current_node.y + dy[i];
+
+                // Check if the next position is within the map boundaries
+                if (next_x >= 0 && next_x < inflated_map.info.width && next_y >= 0 && next_y < inflated_map.info.height) {
+                    // Check if the next position is not an obstacle (occupancy > 50)
+                    int index = next_y * inflated_map.info.width + next_x;
+                    if (inflated_map.data[index] < 5 && !closed_list[next_y][next_x]) {
+                        Node neighbor(next_x, next_y);
+                        neighbor.g = current_node.g + 1.0; // Assuming the cost of moving to a neighbor is 1
+                        neighbor.h = calculateHeuristic(neighbor.x, neighbor.y, goal_grid_x, goal_grid_y);
+                        neighbor.f = neighbor.g + neighbor.h;
+                        neighbor.parent = new Node(current_node);
+                        open_list.push(neighbor);
+                        closed_list[next_y][next_x] = true;
+                    }
+                }
+            }
+        }
+
+        // Goal not reachable, return an empty path
+        ROS_WARN("Goal not reachable. Failed to find a path.");
+        return std::vector<geometry_msgs::Point>();
+    }
+
+    struct routePoint {
+        int pointVal;
+        int pointIndex;
+        geometry_msgs::Point pointPose;
+    };
+
+    std::vector<geometry_msgs::Point> prunePath(const nav_msgs::OccupancyGrid& map, const std::vector<geometry_msgs::Point>& path) {
+        if(map.data.empty() || path.empty()) return std::vector<geometry_msgs::Point> ();
+        std::cout << "路径点数量:" << path.size() << std::endl;
+
+        double resolution = 0.05;
+        std::vector<routePoint> new_route;
+
+        for(int i = 0; i < path.size(); ++i) {
+            routePoint curPoint;
+            curPoint.pointPose.x = path[i].x;
+            curPoint.pointPose.y = path[i].y;
+            int path_index = std::round((path[i].x - map.info.origin.position.x) / resolution) +map.info.width *std::round(curPoint.pointPose.y / resolution) + std::floor(map.info.height * map.info.width / 2);
+            curPoint.pointVal = 1;
+            curPoint.pointIndex = path_index;
+            new_route.push_back(curPoint);
+        }
+        std::cout << "一维向量的长度:" << new_route.size() << std::endl;
+        std::cout << "map.data.size():" << map.data.size() << std::endl;
+        std::cout << "map.info.height:" << map.info.height << std::endl;
+        std::cout << "map.info.width:" << map.info.width << std::endl;
+        std::vector<geometry_msgs::Point> prunedPath;
+        geometry_msgs::Point prunedPoints;
+        prunedPoints.x = new_route[0].pointPose.x;
+        prunedPoints.y = new_route[0].pointPose.y;
+        prunedPath.push_back(prunedPoints);
+        bool end_flag = true;
+        int idx = 0;
+        while(end_flag){
+            for(int j = new_route.size() - 1; j >= idx + 1; --j){
+                double start_x = new_route[idx].pointPose.x;
+                double start_y = new_route[idx].pointPose.y;
+                double end_x = new_route[j].pointPose.x;
+                double end_y = new_route[j].pointPose.y;
+                double theta = atan2(end_y - start_y, end_x - start_x);
+                double dx = cos(theta);
+                double dy = sin(theta);
+                int L = std::floor(std::sqrt((end_x - start_x) * (end_x - start_x) + (end_y - start_y) * (end_y - start_y)) / (map.info.resolution));
+                
+                bool cross = true;
+                int map_or_x = map.info.origin.position.x;
+                    int map_or_y = map.info.origin.position.y;
+                    // int Node_index = std::round(start_x / map.info.resolution +  k * dx) + map.info.width * std::round((start_y / map.info.resolution + k * dy)) + std::floor(map.info.height * map.info.width / 2);
+                for (int k = 1; k <= L; ++k) {
+                    double p_x = start_x + k*dx;
+                    double p_y = start_y + k*dy;
+                    int Node_index = std::floor((p_x-map_or_x)/resolution) + map.info.width*std::floor((p_y-map_or_y)/resolution);
+                    if(map.data[Node_index] >= 50) {
+                        cross = false;
+                        break;
+                    }                   
+                }
+                
+                if(cross == true) {
+                    if(j >= new_route.size() - 5)
+                        end_flag = false;
+                    idx = j;
+                    prunedPoints.x = new_route[idx].pointPose.x;
+                    prunedPoints.y = new_route[idx].pointPose.y;
+                    prunedPath.push_back(prunedPoints);                   
+                }
+
+
+            }
+        }
+        
+
+        // for (int i = 0; i <= new_route.size(); ++i) {
+        //     geometry_msgs::Point prunedPoints;
+        //     if(new_route[i].pointVal == 1) {
+        //         prunedPoints.x = new_route[i].pointPose.x;
+        //         prunedPoints.y = new_route[i].pointPose.y;
+        //         prunedPath.push_back(prunedPoints);
+        //     }
+        // }
+        std::cout << "剪枝后剩余的点的数量为:  " << prunedPath.size() << std::endl;
+        return prunedPath;
+    }
+
+
+
+    // Publish the planned path
+    void publishPath(const std::vector<geometry_msgs::Point>& path) {
+        nav_msgs::Path path_msg;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.header.frame_id = "map"; // Assuming the path is in the map frame
+
+        // Convert the vector of points to the path message
+        for (const auto& point : path) {
+            geometry_msgs::PoseStamped pose;
+            pose.header = path_msg.header;
+            pose.pose.position.x = point.x;
+            pose.pose.position.y = point.y;
+            pose.pose.position.z = 0.0; // Assuming the path is in 2D
+            pose.pose.orientation.x = 0.0;
+            pose.pose.orientation.y = 0.0;
+            pose.pose.orientation.z = 0.0;
+            pose.pose.orientation.w = 1.0;
+            path_msg.poses.push_back(pose);
+        }
+
+        // Publish the path message
+        path_pub.publish(path_msg);
+    }
+
+    // Publish the planned path
+    void publistOriginPath(const std::vector<geometry_msgs::Point>& path) {
+        nav_msgs::Path path_msg;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.header.frame_id = "map"; // Assuming the path is in the map frame
+
+        // Convert the vector of points to the path message
+        for (const auto& point : path) {
+            geometry_msgs::PoseStamped pose;
+            pose.header = path_msg.header;
+            pose.pose.position.x = point.x;
+            pose.pose.position.y = point.y;
+            pose.pose.position.z = 0.0; // Assuming the path is in 2D
+            pose.pose.orientation.x = 0.0;
+            pose.pose.orientation.y = 0.0;
+            pose.pose.orientation.z = 0.0;
+            pose.pose.orientation.w = 1.0;
+            path_msg.poses.push_back(pose);
+        }
+
+        // Publish the path message
+        ori_path_pub.publish(path_msg);
+    }
+
+    // Main loop of the node
+    void run() {
+        ros::Rate loop_rate(planning_frequency);
+
+        while (ros::ok()) {
+            // Call the A* path planning algorithm
+            std::vector<geometry_msgs::Point> path = astarPlanner();
+
+            std::vector<geometry_msgs::Point> prune_Path = prunePath(inflated_map, path);
+
+            // Publish the path (you can convert the vector of points to a ROS message)
+            publishPath(prune_Path);
+            publistOriginPath(path);
+
+            ros::spinOnce();
+            loop_rate.sleep();
+        }
+    }
+
+
+
+
+private:
+    ros::NodeHandle nh;
+    ros::Subscriber robot_pose_sub;
+    ros::Subscriber goal_sub;
+    ros::Subscriber map_sub;
+    ros::Publisher path_pub;
+    ros::Publisher ori_path_pub;
+    ros::Publisher binary_map_pub; // Publisher for binary map
+    ros::Publisher inf_map_pub;
+
+    // Planning frequency parameter
+    double planning_frequency;
+
+    // Current robot pose and goal position
+    geometry_msgs::PoseStamped current_robot_pose;
+    geometry_msgs::PoseStamped goal_position;
+
+    double inflation_radius;
+
+    // OccupancyGrid to hold the map data
+    nav_msgs::OccupancyGrid map;
+    nav_msgs::OccupancyGrid inflated_map;
+    bool map_received;
+
+
+    // Helper function to inflate the obstacles in the map
+void inflateObstacles(double d_cell, double inflation_r) {
+    // Copy the original map data to a temporary map
+    inflated_map = map;
+
+    // Calculate the inflation radius in terms of grid cells
+    int inflation_radius_in_cells = std::ceil(inflation_r / d_cell);
+
+    // Define the possible movement directions (4-connectivity)
+    std::vector<int> dx = {-1, 0, 1, -1, 1, -1, 0, 1};
+    std::vector<int> dy = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    // Traverse the map and inflate obstacles
+    for (int y = 0; y < map.info.height; ++y) {
+        for (int x = 0; x < map.info.width; ++x) {
+            // Check if the cell is an obstacle
+            int index = y * map.info.width + x;
+            if (map.data[index] == 100) {
+                // Inflate the obstacle
+                for (int r = 1; r <= inflation_radius_in_cells; ++r) {
+                    for (size_t i = 0; i < dx.size(); ++i) {
+                        int nx = x + dx[i] * r;
+                        int ny = y + dy[i] * r;
+
+                        // Check if the neighbor cell is within the map boundaries
+                        if (nx >= 0 && nx < map.info.width && ny >= 0 && ny < map.info.height) {
+                            int nIndex = ny * map.info.width + nx;
+                            inflated_map.data[nIndex] = 100;
+                            // if (inflated_map.data[nIndex] != 100) {
+                            //     // Inflate the cell
+                            //     inflated_map.data[nIndex] = 100;
+                            // }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+    // Helper function to calculate the Euclidean distance heuristic
+    double calculateHeuristic(int x1, int y1, int x2, int y2) {
+        return std::sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+    }
+
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "astar_planner_node");
+
+    AStarPlannerNode planner_node;
+    planner_node.run();
+
+    return 0;
+}
